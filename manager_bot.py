@@ -20,7 +20,11 @@ SYSTEM_PROMPT = """
 не выдумывай, а честно скажи, что человек скоро ответит сам, когда будет на месте.
 """.strip()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("manager_bot")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -33,8 +37,15 @@ history: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 20
 
 
+def who(message: Message) -> str:
+    u = message.from_user
+    username = f"@{u.username}" if u and u.username else "(без юзернейма)"
+    return f"{username} id={u.id if u else '?'} chat_id={message.chat.id}"
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    log.info(f"CMD /start от {who(message)}")
     afk_mode[message.chat.id] = False
     await message.answer(
         "Привет! Я включаюсь, когда тебя нет на месте.\n\n"
@@ -47,18 +58,21 @@ async def cmd_start(message: Message):
 @dp.message(Command("away"))
 async def cmd_away(message: Message):
     afk_mode[message.chat.id] = True
+    log.info(f"CMD /away от {who(message)} — АФК включён для chat_id={message.chat.id}")
     await message.answer("Ок, включил автоответ. Отвечаю за тебя, пока ты не вернёшься 👋")
 
 
 @dp.message(Command("back"))
 async def cmd_back(message: Message):
     afk_mode[message.chat.id] = False
+    log.info(f"CMD /back от {who(message)} — АФК выключен для chat_id={message.chat.id}")
     await message.answer("Выключил автоответ, дальше сам 🙂")
 
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
     history[message.chat.id] = []
+    log.info(f"CMD /reset от {who(message)}")
     await message.answer("История диалога очищена.")
 
 
@@ -66,11 +80,16 @@ async def cmd_reset(message: Message):
 async def handle_message(message: Message):
     chat_id = message.chat.id
     text = message.text or ""
+
+    log.info(f"IN  | {who(message)}: {text!r}")
+
     if not text:
+        log.info("    -> пропущено: сообщение без текста (стикер/фото/голос и т.п.)")
         return
 
     # Отвечаем только если для этого чата включён АФК-режим
     if not afk_mode.get(chat_id, False):
+        log.info(f"    -> проигнорировано: АФК выключен для chat_id={chat_id} (нужно /away)")
         return
 
     chat_history = history.setdefault(chat_id, [])
@@ -87,10 +106,11 @@ async def handle_message(message: Message):
         )
         reply_text = (response.choices[0].message.content or "").strip()
     except Exception:
-        logging.exception("Ошибка при запросе к Groq API")
+        log.exception("Ошибка при запросе к Groq API")
         reply_text = "Секунду, что-то пошло не так технически — напишу позже."
 
     chat_history.append({"role": "assistant", "content": reply_text})
+    log.info(f"OUT | -> chat_id={chat_id}: {reply_text!r}")
     await message.answer(reply_text)
 
 
