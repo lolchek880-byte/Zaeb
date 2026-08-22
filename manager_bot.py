@@ -12,10 +12,9 @@ from groq import AsyncGroq
 
 # =========================================================
 # MANAGER VERSION
-# При обновлении меняй только это значение
 # =========================================================
 
-MANAGER_VERSION = "0.1.1 BETA"
+MANAGER_VERSION = "0.1.3 BETA"
 
 
 # =========================================================
@@ -28,6 +27,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL = "openai/gpt-oss-120b"
 
 MAX_HISTORY_MESSAGES = 30
+
+# Максимальное количество запомненных message_id
+MAX_PROCESSED_MESSAGES = 10000
 
 
 # =========================================================
@@ -126,6 +128,7 @@ log = logging.getLogger("business_manager")
 # =========================================================
 
 bot = Bot(token=BOT_TOKEN)
+
 dp = Dispatcher()
 
 groq = AsyncGroq(
@@ -143,12 +146,26 @@ history: dict[int, list[dict[str, str]]] = defaultdict(list)
 
 business_connections: dict[str, BusinessConnection] = {}
 
+# ---------------------------------------------------------
+# ЗАЩИТА ОТ ДВОЙНОЙ ОБРАБОТКИ
+# ---------------------------------------------------------
+#
+# Здесь храним:
+# (business_connection_id, message_id)
+#
+# Если Telegram повторно передаст тот же message_id,
+# бот второй раз отвечать не будет.
+#
+
+processed_messages: set[tuple[str, int]] = set()
+
 
 # =========================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================================================
 
 def who(message: Message) -> str:
+
     user = message.from_user
 
     if not user:
@@ -164,7 +181,62 @@ def who(message: Message) -> str:
 
 
 def trim_history(chat_id: int):
-    history[chat_id] = history[chat_id][-MAX_HISTORY_MESSAGES:]
+
+    history[chat_id] = history[chat_id][
+        -MAX_HISTORY_MESSAGES:
+    ]
+
+
+def check_duplicate_message(
+    business_connection_id: str | None,
+    message_id: int | None,
+) -> bool:
+
+    """
+    Возвращает True, если сообщение уже обрабатывалось.
+    """
+
+    if not business_connection_id:
+        return False
+
+    if not message_id:
+        return False
+
+    message_key = (
+        business_connection_id,
+        message_id,
+    )
+
+    if message_key in processed_messages:
+
+        log.warning(
+            "DUPLICATE MESSAGE SKIPPED | "
+            "connection=%s | message_id=%s",
+            business_connection_id,
+            message_id,
+        )
+
+        return True
+
+    processed_messages.add(
+        message_key
+    )
+
+    # Защита от бесконечного роста памяти
+    if len(processed_messages) > MAX_PROCESSED_MESSAGES:
+
+        log.info(
+            "Очищаем список обработанных сообщений"
+        )
+
+        processed_messages.clear()
+
+        # Сразу добавляем текущее сообщение обратно
+        processed_messages.add(
+            message_key
+        )
+
+    return False
 
 
 # =========================================================
@@ -266,7 +338,9 @@ async def handle_business_connection(
     connection: BusinessConnection
 ):
 
-    business_connections[connection.id] = connection
+    business_connections[
+        connection.id
+    ] = connection
 
     user = connection.user
 
@@ -296,7 +370,9 @@ async def handle_business_connection(
             business_connection_id=connection.id
         )
 
-        business_connections[actual.id] = actual
+        business_connections[
+            actual.id
+        ] = actual
 
         log.info(
             "BUSINESS CONNECTION CHECK | "
@@ -322,25 +398,50 @@ async def handle_business_connection(
 @dp.business_message()
 async def handle_business_message(message: Message):
 
-    business_connection_id = message.business_connection_id
+    business_connection_id = (
+        message.business_connection_id
+    )
+
     chat_id = message.chat.id
-    text = (message.text or "").strip()
+
+    message_id = message.message_id
+
+    text = (
+        message.text or ""
+    ).strip()
+
+    # =====================================================
+    # ЗАЩИТА ОТ ДВОЙНОГО ОТВЕТА
+    # =====================================================
+
+    if check_duplicate_message(
+        business_connection_id,
+        message_id,
+    ):
+
+        return
+
+    # =====================================================
+    # LOG
+    # =====================================================
 
     log.info(
         "BUSINESS MESSAGE | "
         "chat_id=%s | "
+        "message_id=%s | "
         "connection=%s | "
         "from=%s | "
         "text=%r",
         chat_id,
+        message_id,
         business_connection_id,
         who(message),
         text,
     )
 
-    # -----------------------------------------------------
-    # Проверка Business Connection ID
-    # -----------------------------------------------------
+    # =====================================================
+    # ПРОВЕРКА BUSINESS CONNECTION ID
+    # =====================================================
 
     if not business_connection_id:
 
@@ -350,9 +451,9 @@ async def handle_business_message(message: Message):
 
         return
 
-    # -----------------------------------------------------
-    # Только текстовые сообщения
-    # -----------------------------------------------------
+    # =====================================================
+    # ТОЛЬКО ТЕКСТОВЫЕ СООБЩЕНИЯ
+    # =====================================================
 
     if not text:
 
@@ -362,9 +463,9 @@ async def handle_business_message(message: Message):
 
         return
 
-    # -----------------------------------------------------
+    # =====================================================
     # AFK
-    # -----------------------------------------------------
+    # =====================================================
 
     if not afk_enabled:
 
@@ -374,20 +475,26 @@ async def handle_business_message(message: Message):
 
         return
 
-    # -----------------------------------------------------
-    # Business Connection
-    # -----------------------------------------------------
+    # =====================================================
+    # BUSINESS CONNECTION
+    # =====================================================
 
-    connection = business_connections.get(
-        business_connection_id
+    connection = (
+        business_connections.get(
+            business_connection_id
+        )
     )
 
     if connection is None:
 
         try:
 
-            connection = await bot.get_business_connection(
-                business_connection_id=business_connection_id
+            connection = (
+                await bot.get_business_connection(
+                    business_connection_id=(
+                        business_connection_id
+                    )
+                )
             )
 
             business_connections[
@@ -401,6 +508,10 @@ async def handle_business_message(message: Message):
             )
 
             return
+
+    # =====================================================
+    # ПРОВЕРКА CONNECTION
+    # =====================================================
 
     if not connection.is_enabled:
 
@@ -418,9 +529,9 @@ async def handle_business_message(message: Message):
 
         return
 
-    # -----------------------------------------------------
-    # Не отвечаем владельцу Business-аккаунта
-    # -----------------------------------------------------
+    # =====================================================
+    # НЕ ОТВЕЧАЕМ ВЛАДЕЛЬЦУ BUSINESS-АККАУНТА
+    # =====================================================
 
     owner_id = (
         connection.user.id
@@ -458,14 +569,47 @@ async def handle_business_message(message: Message):
     # =====================================================
 
     variation_instruction = random.choice([
-        "Ответь естественно и коротко. Не заканчивай ответ вопросом без необходимости.",
-        "Сконцентрируйся на последнем сообщении. Не повторяй предыдущие формулировки.",
-        "Ответь как в обычном живом чате. Можно просто отреагировать без вопроса.",
-        "Не используй шаблонный ответ. Сформируй реакцию именно на это сообщение.",
-        "Не повторяй уже использованные вопросы или фразы.",
-        "Сделай ответ естественным и немного непредсказуемым по форме.",
-        "Если вопрос не нужен для продолжения разговора — не задавай его.",
-        "Сначала отреагируй на смысл сообщения, а уже потом решай, нужен ли вопрос.",
+
+        (
+            "Ответь естественно и коротко. "
+            "Не заканчивай ответ вопросом без необходимости."
+        ),
+
+        (
+            "Сконцентрируйся на последнем сообщении. "
+            "Не повторяй предыдущие формулировки."
+        ),
+
+        (
+            "Ответь как в обычном живом чате. "
+            "Можно просто отреагировать без вопроса."
+        ),
+
+        (
+            "Не используй шаблонный ответ. "
+            "Сформируй реакцию именно на это сообщение."
+        ),
+
+        (
+            "Не повторяй уже использованные вопросы "
+            "или фразы."
+        ),
+
+        (
+            "Сделай ответ естественным "
+            "и немного непредсказуемым по форме."
+        ),
+
+        (
+            "Если вопрос не нужен для продолжения разговора — "
+            "не задавай его."
+        ),
+
+        (
+            "Сначала отреагируй на смысл сообщения, "
+            "а уже потом решай, нужен ли вопрос."
+        ),
+
     ])
 
     # =====================================================
@@ -475,32 +619,44 @@ async def handle_business_message(message: Message):
     try:
 
         log.info(
-            "GROQ REQUEST | chat_id=%s | model=%s",
+            "GROQ REQUEST | "
+            "chat_id=%s | "
+            "message_id=%s | "
+            "model=%s",
             chat_id,
+            message_id,
             MODEL,
         )
 
         messages = [
+
             {
                 "role": "system",
                 "content": SYSTEM_PROMPT,
             },
+
             *chat_history,
+
             {
                 "role": "system",
                 "content": variation_instruction,
             },
+
         ]
 
-        response = await groq.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=400,
-            temperature=1.0,
+        response = (
+            await groq.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                max_tokens=400,
+                temperature=1.0,
+            )
         )
 
         reply_text = (
-            response.choices[0].message.content or ""
+            response.choices[0]
+            .message
+            .content or ""
         ).strip()
 
         if not reply_text:
@@ -538,8 +694,10 @@ async def handle_business_message(message: Message):
     log.info(
         "GROQ RESPONSE | "
         "chat_id=%s | "
+        "message_id=%s | "
         "text=%r",
         chat_id,
+        message_id,
         reply_text,
     )
 
@@ -560,7 +718,9 @@ async def handle_business_message(message: Message):
         sent = await bot.send_message(
             chat_id=chat_id,
             text=reply_text,
-            business_connection_id=business_connection_id,
+            business_connection_id=(
+                business_connection_id
+            ),
         )
 
         log.info(
@@ -603,9 +763,9 @@ async def main():
         afk_enabled,
     )
 
-    # -----------------------------------------------------
-    # Проверка Telegram
-    # -----------------------------------------------------
+    # =====================================================
+    # ПРОВЕРКА TELEGRAM
+    # =====================================================
 
     try:
 
@@ -638,7 +798,9 @@ async def main():
 
         await dp.start_polling(
             bot,
-            allowed_updates=dp.resolve_used_update_types(),
+            allowed_updates=(
+                dp.resolve_used_update_types()
+            ),
         )
 
     finally:
@@ -651,4 +813,5 @@ async def main():
 # =========================================================
 
 if __name__ == "__main__":
+
     asyncio.run(main())
