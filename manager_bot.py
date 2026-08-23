@@ -3,18 +3,26 @@ import logging
 import os
 import random
 from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, BusinessConnection
+from aiogram.types import (
+    Message,
+    BusinessConnection,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from groq import AsyncGroq
 
 
 # =========================================================
 # MANAGER VERSION
+# При обновлении меняй только это значение
 # =========================================================
 
-MANAGER_VERSION = "0.1.3 BETA"
+MANAGER_VERSION = "0.2.0"
 
 
 # =========================================================
@@ -24,12 +32,14 @@ MANAGER_VERSION = "0.1.3 BETA"
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Канал для обязательной подписки
+# Например:
+# REQUIRED_CHANNEL=@my_channel
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
+
 MODEL = "openai/gpt-oss-120b"
 
 MAX_HISTORY_MESSAGES = 30
-
-# Максимальное количество запомненных message_id
-MAX_PROCESSED_MESSAGES = 10000
 
 
 # =========================================================
@@ -76,7 +86,6 @@ SYSTEM_PROMPT = """
 - Не задавай вопрос только ради продолжения диалога.
 - Не используй одинаковые фразы несколько сообщений подряд.
 - Не злоупотребляй эмодзи.
-- Не ставь эмодзи в каждом сообщении.
 - Разговорный стиль допустим.
 - Не используй списки, если обычный текст подходит лучше.
 
@@ -110,6 +119,11 @@ if not GROQ_API_KEY:
         "Не найдена переменная окружения GROQ_API_KEY"
     )
 
+if not REQUIRED_CHANNEL:
+    raise RuntimeError(
+        "Не найдена переменная окружения REQUIRED_CHANNEL"
+    )
+
 
 # =========================================================
 # LOGGING
@@ -128,7 +142,6 @@ log = logging.getLogger("business_manager")
 # =========================================================
 
 bot = Bot(token=BOT_TOKEN)
-
 dp = Dispatcher()
 
 groq = AsyncGroq(
@@ -146,26 +159,24 @@ history: dict[int, list[dict[str, str]]] = defaultdict(list)
 
 business_connections: dict[str, BusinessConnection] = {}
 
-# ---------------------------------------------------------
-# ЗАЩИТА ОТ ДВОЙНОЙ ОБРАБОТКИ
-# ---------------------------------------------------------
-#
-# Здесь храним:
-# (business_connection_id, message_id)
-#
-# Если Telegram повторно передаст тот же message_id,
-# бот второй раз отвечать не будет.
-#
 
-processed_messages: set[tuple[str, int]] = set()
+# =========================================================
+# ВРЕМЯ МОСКВЫ
+# =========================================================
+
+def get_moscow_time() -> str:
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
+
+    return now.strftime(
+        "%d.%m.%Y %H:%M:%S"
+    )
 
 
 # =========================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# WHO
 # =========================================================
 
 def who(message: Message) -> str:
-
     user = message.from_user
 
     if not user:
@@ -180,63 +191,108 @@ def who(message: Message) -> str:
     return f"{username} id={user.id}"
 
 
-def trim_history(chat_id: int):
+# =========================================================
+# HISTORY
+# =========================================================
 
+def trim_history(chat_id: int):
     history[chat_id] = history[chat_id][
         -MAX_HISTORY_MESSAGES:
     ]
 
 
-def check_duplicate_message(
-    business_connection_id: str | None,
-    message_id: int | None,
-) -> bool:
+# =========================================================
+# ПРОВЕРКА ПОДПИСКИ
+# =========================================================
 
-    """
-    Возвращает True, если сообщение уже обрабатывалось.
-    """
+async def is_subscribed(user_id: int) -> bool:
 
-    if not business_connection_id:
+    try:
+
+        member = await bot.get_chat_member(
+            chat_id=REQUIRED_CHANNEL,
+            user_id=user_id,
+        )
+
+        # Подписаны:
+        # creator
+        # administrator
+        # member
+
+        if member.status in (
+            "creator",
+            "administrator",
+            "member",
+        ):
+            return True
+
+        # Для некоторых каналов/настроек
+        # пользователь может иметь статус restricted,
+        # но оставаться подписанным.
+        if member.status == "restricted":
+            return bool(
+                getattr(member, "is_member", False)
+            )
+
         return False
 
-    if not message_id:
+    except Exception:
+
+        log.exception(
+            "Ошибка проверки подписки | user_id=%s",
+            user_id,
+        )
+
         return False
 
-    message_key = (
-        business_connection_id,
-        message_id,
+
+# =========================================================
+# КЛАВИАТУРА ПОДПИСКИ
+# =========================================================
+
+def subscription_keyboard() -> InlineKeyboardMarkup:
+
+    channel_url = (
+        f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}"
     )
 
-    if message_key in processed_messages:
-
-        log.warning(
-            "DUPLICATE MESSAGE SKIPPED | "
-            "connection=%s | message_id=%s",
-            business_connection_id,
-            message_id,
-        )
-
-        return True
-
-    processed_messages.add(
-        message_key
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Подписаться",
+                    url=channel_url,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Проверить подписку",
+                    callback_data="check_subscription",
+                )
+            ],
+        ]
     )
 
-    # Защита от бесконечного роста памяти
-    if len(processed_messages) > MAX_PROCESSED_MESSAGES:
 
-        log.info(
-            "Очищаем список обработанных сообщений"
-        )
+# =========================================================
+# СООБЩЕНИЕ О ПОДПИСКЕ
+# =========================================================
 
-        processed_messages.clear()
+async def send_subscription_required(
+    message: Message,
+):
 
-        # Сразу добавляем текущее сообщение обратно
-        processed_messages.add(
-            message_key
-        )
-
-    return False
+    await message.answer(
+        "🔒 <b>Доступ ограничен</b>\n\n"
+        "Чтобы пользоваться Manager, необходимо "
+        "подписаться на наш Telegram-канал.\n\n"
+        "1. Нажми «📢 Подписаться».\n"
+        "2. Подпишись на канал.\n"
+        "3. Вернись сюда и нажми "
+        "«✅ Проверить подписку».",
+        reply_markup=subscription_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 # =========================================================
@@ -248,24 +304,151 @@ async def cmd_start(message: Message):
 
     log.info(
         "CMD /start | %s",
-        who(message)
+        who(message),
     )
 
-    status = (
-        "автоответ включён ✅"
-        if afk_enabled
-        else "автоответ выключен ⛔"
+    user = message.from_user
+
+    if not user:
+
+        await message.answer(
+            "Не удалось определить пользователя."
+        )
+
+        return
+
+    subscribed = await is_subscribed(
+        user.id
     )
+
+    # -----------------------------------------------------
+    # Business Connections
+    # -----------------------------------------------------
+
+    connected_count = len(
+        business_connections
+    )
+
+    enabled_connections = sum(
+        1
+        for connection in business_connections.values()
+        if connection.is_enabled
+    )
+
+    # -----------------------------------------------------
+    # Статус подписки
+    # -----------------------------------------------------
+
+    if subscribed:
+
+        subscription_status = (
+            "Подписка: ✅ подтверждена"
+        )
+
+    else:
+
+        subscription_status = (
+            "Подписка: ❌ не подтверждена"
+        )
+
+    # -----------------------------------------------------
+    # Статус Business
+    # -----------------------------------------------------
+
+    if enabled_connections > 0:
+
+        business_status = (
+            "Business Mode: 🟢 подключён"
+        )
+
+    else:
+
+        business_status = (
+            "Business Mode: 🔴 не подключён"
+        )
 
     await message.answer(
-        f"🍀 Manager {MANAGER_VERSION}\n\n"
-        "Я подключён к Telegram Business.\n\n"
-        "Команды:\n"
+        f"🍀 <b>Manager {MANAGER_VERSION}</b>\n\n"
+        "AI-менеджер для Telegram Business.\n\n"
+        "━━━━━━━━━━━━━━\n"
+        f"{subscription_status}\n"
+        f"{business_status}\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "<b>Как начать:</b>\n"
+        "1️⃣ Подпишись на канал.\n"
+        "2️⃣ Подключи Manager в "
+        "Настройки → Telegram Business → Чат-боты.\n"
+        "3️⃣ Разреши боту отвечать на сообщения.\n"
+        "4️⃣ После этого Manager сможет автоматически "
+        "отвечать в твоих Business-чатах.\n\n"
+        "<b>Команды:</b>\n"
         "/away — включить автоответ\n"
         "/back — выключить автоответ\n"
         "/reset — очистить историю диалогов\n\n"
-        f"Статус: {status}"
+        f"🕐 МСК: <code>{get_moscow_time()}</code>",
+        parse_mode="HTML",
+        reply_markup=(
+            None
+            if subscribed
+            else subscription_keyboard()
+        ),
     )
+
+
+# =========================================================
+# ПРОВЕРКА ПОДПИСКИ КНОПКОЙ
+# =========================================================
+
+@dp.callback_query(
+    lambda callback: callback.data == "check_subscription"
+)
+async def check_subscription(callback):
+
+    user = callback.from_user
+
+    if not user:
+
+        await callback.answer(
+            "Не удалось определить пользователя.",
+            show_alert=True,
+        )
+
+        return
+
+    subscribed = await is_subscribed(
+        user.id
+    )
+
+    if subscribed:
+
+        await callback.answer(
+            "Подписка подтверждена! ✅",
+            show_alert=True,
+        )
+
+        try:
+
+            await callback.message.edit_text(
+                f"✅ <b>Подписка подтверждена!</b>\n\n"
+                f"🍀 Manager {MANAGER_VERSION}\n\n"
+                "Теперь Manager доступен.\n\n"
+                "Подключи его в:\n"
+                "Настройки → Telegram Business → Чат-боты",
+                parse_mode="HTML",
+            )
+
+        except Exception:
+
+            log.exception(
+                "Не удалось изменить сообщение проверки подписки"
+            )
+
+    else:
+
+        await callback.answer(
+            "Подписка не найдена. Сначала подпишись на канал.",
+            show_alert=True,
+        )
 
 
 # =========================================================
@@ -277,15 +460,29 @@ async def cmd_away(message: Message):
 
     global afk_enabled
 
+    user = message.from_user
+
+    if not user:
+        return
+
+    if not await is_subscribed(user.id):
+
+        await send_subscription_required(
+            message
+        )
+
+        return
+
     afk_enabled = True
 
     log.info(
         "AFK ENABLED | %s",
-        who(message)
+        who(message),
     )
 
     await message.answer(
-        f"Manager {MANAGER_VERSION}: автоответ включён ✅"
+        f"🍀 Manager {MANAGER_VERSION}\n"
+        "Автоответчик включён ✅"
     )
 
 
@@ -298,15 +495,29 @@ async def cmd_back(message: Message):
 
     global afk_enabled
 
+    user = message.from_user
+
+    if not user:
+        return
+
+    if not await is_subscribed(user.id):
+
+        await send_subscription_required(
+            message
+        )
+
+        return
+
     afk_enabled = False
 
     log.info(
         "AFK DISABLED | %s",
-        who(message)
+        who(message),
     )
 
     await message.answer(
-        f"Manager {MANAGER_VERSION}: автоответ выключен ⛔"
+        f"🍀 Manager {MANAGER_VERSION}\n"
+        "Автоответчик выключен ⛔"
     )
 
 
@@ -317,15 +528,28 @@ async def cmd_back(message: Message):
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
 
+    user = message.from_user
+
+    if not user:
+        return
+
+    if not await is_subscribed(user.id):
+
+        await send_subscription_required(
+            message
+        )
+
+        return
+
     history.clear()
 
     log.info(
         "HISTORY RESET | %s",
-        who(message)
+        who(message),
     )
 
     await message.answer(
-        "История всех диалогов очищена."
+        "История всех диалогов очищена. 🧹"
     )
 
 
@@ -335,7 +559,7 @@ async def cmd_reset(message: Message):
 
 @dp.business_connection()
 async def handle_business_connection(
-    connection: BusinessConnection
+    connection: BusinessConnection,
 ):
 
     business_connections[
@@ -347,7 +571,11 @@ async def handle_business_connection(
     username = (
         f"@{user.username}"
         if user and user.username
-        else str(user.id if user else "?")
+        else str(
+            user.id
+            if user
+            else "?"
+        )
     )
 
     log.info(
@@ -396,7 +624,9 @@ async def handle_business_connection(
 # =========================================================
 
 @dp.business_message()
-async def handle_business_message(message: Message):
+async def handle_business_message(
+    message: Message,
+):
 
     business_connection_id = (
         message.business_connection_id
@@ -404,44 +634,25 @@ async def handle_business_message(message: Message):
 
     chat_id = message.chat.id
 
-    message_id = message.message_id
-
     text = (
         message.text or ""
     ).strip()
 
-    # =====================================================
-    # ЗАЩИТА ОТ ДВОЙНОГО ОТВЕТА
-    # =====================================================
-
-    if check_duplicate_message(
-        business_connection_id,
-        message_id,
-    ):
-
-        return
-
-    # =====================================================
-    # LOG
-    # =====================================================
-
     log.info(
         "BUSINESS MESSAGE | "
         "chat_id=%s | "
-        "message_id=%s | "
         "connection=%s | "
         "from=%s | "
         "text=%r",
         chat_id,
-        message_id,
         business_connection_id,
         who(message),
         text,
     )
 
-    # =====================================================
-    # ПРОВЕРКА BUSINESS CONNECTION ID
-    # =====================================================
+    # -----------------------------------------------------
+    # Connection
+    # -----------------------------------------------------
 
     if not business_connection_id:
 
@@ -451,9 +662,9 @@ async def handle_business_message(message: Message):
 
         return
 
-    # =====================================================
-    # ТОЛЬКО ТЕКСТОВЫЕ СООБЩЕНИЯ
-    # =====================================================
+    # -----------------------------------------------------
+    # Только текст
+    # -----------------------------------------------------
 
     if not text:
 
@@ -463,9 +674,9 @@ async def handle_business_message(message: Message):
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # AFK
-    # =====================================================
+    # -----------------------------------------------------
 
     if not afk_enabled:
 
@@ -475,14 +686,12 @@ async def handle_business_message(message: Message):
 
         return
 
-    # =====================================================
-    # BUSINESS CONNECTION
-    # =====================================================
+    # -----------------------------------------------------
+    # Business Connection
+    # -----------------------------------------------------
 
-    connection = (
-        business_connections.get(
-            business_connection_id
-        )
+    connection = business_connections.get(
+        business_connection_id
     )
 
     if connection is None:
@@ -509,10 +718,6 @@ async def handle_business_message(message: Message):
 
             return
 
-    # =====================================================
-    # ПРОВЕРКА CONNECTION
-    # =====================================================
-
     if not connection.is_enabled:
 
         log.error(
@@ -529,9 +734,9 @@ async def handle_business_message(message: Message):
 
         return
 
-    # =====================================================
-    # НЕ ОТВЕЧАЕМ ВЛАДЕЛЬЦУ BUSINESS-АККАУНТА
-    # =====================================================
+    # -----------------------------------------------------
+    # Владелец аккаунта
+    # -----------------------------------------------------
 
     owner_id = (
         connection.user.id
@@ -551,8 +756,24 @@ async def handle_business_message(message: Message):
 
         return
 
+# =====================================================
+# ОБЯЗАТЕЛЬНАЯ ПОДПИСКА
+# =====================================================
+
+sender = message.from_user
+
+if sender:
+
+    subscribed = await is_subscribed(
+        sender.id
+    )
+
+    if not subscribed:
+        ...
+        return      
+
     # =====================================================
-    # ИСТОРИЯ
+    # HISTORY
     # =====================================================
 
     chat_history = history[chat_id]
@@ -569,48 +790,29 @@ async def handle_business_message(message: Message):
     # =====================================================
 
     variation_instruction = random.choice([
-
-        (
-            "Ответь естественно и коротко. "
-            "Не заканчивай ответ вопросом без необходимости."
-        ),
-
-        (
-            "Сконцентрируйся на последнем сообщении. "
-            "Не повторяй предыдущие формулировки."
-        ),
-
-        (
-            "Ответь как в обычном живом чате. "
-            "Можно просто отреагировать без вопроса."
-        ),
-
-        (
-            "Не используй шаблонный ответ. "
-            "Сформируй реакцию именно на это сообщение."
-        ),
-
-        (
-            "Не повторяй уже использованные вопросы "
-            "или фразы."
-        ),
-
-        (
-            "Сделай ответ естественным "
-            "и немного непредсказуемым по форме."
-        ),
-
-        (
-            "Если вопрос не нужен для продолжения разговора — "
-            "не задавай его."
-        ),
-
-        (
-            "Сначала отреагируй на смысл сообщения, "
-            "а уже потом решай, нужен ли вопрос."
-        ),
-
+        "Ответь естественно и коротко. Не заканчивай ответ вопросом без необходимости.",
+        "Сконцентрируйся на последнем сообщении. Не повторяй предыдущие формулировки.",
+        "Ответь как в обычном живом чате. Можно просто отреагировать без вопроса.",
+        "Не используй шаблонный ответ. Сформируй реакцию именно на это сообщение.",
+        "Не повторяй уже использованные вопросы или фразы.",
+        "Сделай ответ естественным и немного непредсказуемым по форме.",
+        "Если вопрос не нужен для продолжения разговора — не задавай его.",
+        "Сначала отреагируй на смысл сообщения, а уже потом решай, нужен ли вопрос.",
     ])
+
+    # =====================================================
+    # АКТУАЛЬНОЕ ВРЕМЯ МОСКВЫ
+    # =====================================================
+
+    moscow_time = get_moscow_time()
+
+    time_context = (
+        f"Текущее время по Москве (МСК, UTC+3): "
+        f"{moscow_time}.\n"
+        "Если собеседник спрашивает текущее время, "
+        "ориентируйся именно на это значение. "
+        "Не придумывай другое время."
+    )
 
     # =====================================================
     # GROQ
@@ -621,18 +823,22 @@ async def handle_business_message(message: Message):
         log.info(
             "GROQ REQUEST | "
             "chat_id=%s | "
-            "message_id=%s | "
-            "model=%s",
+            "model=%s | "
+            "moscow_time=%s",
             chat_id,
-            message_id,
             MODEL,
+            moscow_time,
         )
 
         messages = [
-
             {
                 "role": "system",
                 "content": SYSTEM_PROMPT,
+            },
+
+            {
+                "role": "system",
+                "content": time_context,
             },
 
             *chat_history,
@@ -641,7 +847,6 @@ async def handle_business_message(message: Message):
                 "role": "system",
                 "content": variation_instruction,
             },
-
         ]
 
         response = (
@@ -655,8 +860,7 @@ async def handle_business_message(message: Message):
 
         reply_text = (
             response.choices[0]
-            .message
-            .content or ""
+            .message.content or ""
         ).strip()
 
         if not reply_text:
@@ -681,7 +885,7 @@ async def handle_business_message(message: Message):
         )
 
     # =====================================================
-    # СОХРАНЕНИЕ ОТВЕТА
+    # СОХРАНЕНИЕ
     # =====================================================
 
     chat_history.append({
@@ -694,15 +898,13 @@ async def handle_business_message(message: Message):
     log.info(
         "GROQ RESPONSE | "
         "chat_id=%s | "
-        "message_id=%s | "
         "text=%r",
         chat_id,
-        message_id,
         reply_text,
     )
 
     # =====================================================
-    # ОТПРАВКА
+    # TELEGRAM SEND
     # =====================================================
 
     try:
@@ -763,9 +965,14 @@ async def main():
         afk_enabled,
     )
 
-    # =====================================================
-    # ПРОВЕРКА TELEGRAM
-    # =====================================================
+    log.info(
+        "REQUIRED CHANNEL: %s",
+        REQUIRED_CHANNEL,
+    )
+
+    # -----------------------------------------------------
+    # Проверяем Telegram
+    # -----------------------------------------------------
 
     try:
 
@@ -813,5 +1020,4 @@ async def main():
 # =========================================================
 
 if __name__ == "__main__":
-
     asyncio.run(main())
