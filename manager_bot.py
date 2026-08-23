@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,6 @@ from aiogram.types import (
     Message,
     BusinessConnection,
 )
-
 from groq import AsyncGroq
 
 
@@ -28,16 +26,16 @@ from groq import AsyncGroq
 # MANAGER
 # =========================================================
 
-MANAGER_VERSION = "0.3.0"
+MANAGER_VERSION = "0.3.1"
 
-MODEL = "openai/gpt-oss-120b"
+# Если эта модель недоступна в твоём Groq-аккаунте,
+# укажи доступную модель через переменную GROQ_MODEL в Railway.
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 TIMEZONE = ZoneInfo("Europe/Moscow")
 
 MAX_HISTORY_MESSAGES = 40
-
-MAX_REPLY_TOKENS = 1200
-
+MAX_REPLY_TOKENS = 2500
 MAX_RETRIES = 2
 
 
@@ -47,43 +45,26 @@ MAX_RETRIES = 2
 
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
-
-# Владелец бота.
-# Можно указать вручную через Railway:
-# OWNER_ID=123456789
 OWNER_ID_ENV = os.getenv("OWNER_ID")
 
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "Не найдена переменная TG_BOT_TOKEN"
-    )
+    raise RuntimeError("Не найдена переменная TG_BOT_TOKEN")
 
 if not GROQ_API_KEY:
-    raise RuntimeError(
-        "Не найдена переменная GROQ_API_KEY"
-    )
+    raise RuntimeError("Не найдена переменная GROQ_API_KEY")
 
 if not REQUIRED_CHANNEL:
-    raise RuntimeError(
-        "Не найдена переменная REQUIRED_CHANNEL"
-    )
+    raise RuntimeError("Не найдена переменная REQUIRED_CHANNEL")
 
 
 # =========================================================
 # DATA
 # =========================================================
 
-DATA_DIR = Path(
-    os.getenv("DATA_DIR", "/data")
-)
-
-DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DATA_FILE = DATA_DIR / "manager_data.json"
 
@@ -104,17 +85,11 @@ log = logging.getLogger("manager")
 # TELEGRAM / GROQ
 # =========================================================
 
-bot = Bot(
-    token=BOT_TOKEN
-)
+bot = Bot(token=BOT_TOKEN)
 
-dp = Dispatcher(
-    storage=MemoryStorage()
-)
+dp = Dispatcher(storage=MemoryStorage())
 
-groq = AsyncGroq(
-    api_key=GROQ_API_KEY
-)
+groq = AsyncGroq(api_key=GROQ_API_KEY)
 
 
 # =========================================================
@@ -142,9 +117,7 @@ DEFAULT_DATA = {
     "questions": [],
 
     "settings": {
-        "style": (
-            "естественный, живой, разговорный"
-        ),
+        "style": "естественный, живой, разговорный",
         "default_length": "short",
         "emoji_level": "normal",
     },
@@ -152,64 +125,103 @@ DEFAULT_DATA = {
     "contacts": {},
 
     "history": {},
+
+    "business_connections": {},
 }
 
 
 # =========================================================
 # LOAD / SAVE
+# ВАЖНО: save_data объявлена ДО load_data.
 # =========================================================
+
+def save_data(data: dict[str, Any] | None = None) -> None:
+    global DATA
+
+    if data is None:
+        data = DATA
+
+    temp_file = DATA_FILE.with_suffix(".tmp")
+
+    try:
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        temp_file.replace(DATA_FILE)
+
+    except Exception:
+        log.exception("Ошибка сохранения данных")
+
+
+def deep_copy(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
 
 def load_data() -> dict[str, Any]:
 
     if not DATA_FILE.exists():
 
-        data = json.loads(
-            json.dumps(DEFAULT_DATA)
-        )
+        data = deep_copy(DEFAULT_DATA)
 
         if OWNER_ID_ENV:
-            data["owner_id"] = int(
-                OWNER_ID_ENV
-            )
+            try:
+                data["owner_id"] = int(OWNER_ID_ENV)
+            except ValueError:
+                log.error("OWNER_ID должен быть числом")
 
+        # save_data уже существует к этому моменту.
+        # Передаём data напрямую, поэтому DATA пока не нужен.
         save_data(data)
 
         return data
 
     try:
-
         with open(
             DATA_FILE,
             "r",
             encoding="utf-8",
         ) as file:
-
             data = json.load(file)
 
     except Exception:
-
         log.exception(
             "Не удалось прочитать manager_data.json"
         )
+        data = deep_copy(DEFAULT_DATA)
 
-        data = json.loads(
-            json.dumps(DEFAULT_DATA)
-        )
-
-    # Добавляем отсутствующие разделы
-    for key, value in DEFAULT_DATA.items():
-
+    # Добавляем новые разделы при обновлении версии.
+    for key, default_value in DEFAULT_DATA.items():
         if key not in data:
-            data[key] = value
+            data[key] = deep_copy(default_value)
 
-    if (
-        not data.get("owner_id")
-        and OWNER_ID_ENV
-    ):
+    # Гарантируем вложенные разделы.
+    for key, default_value in DEFAULT_DATA["profile"].items():
+        data.setdefault("profile", {}).setdefault(key, default_value)
 
-        data["owner_id"] = int(
-            OWNER_ID_ENV
-        )
+    for key, default_value in DEFAULT_DATA["settings"].items():
+        data.setdefault("settings", {}).setdefault(key, default_value)
+
+    data.setdefault("schedule", [])
+    data.setdefault("facts", [])
+    data.setdefault("questions", [])
+    data.setdefault("contacts", {})
+    data.setdefault("history", {})
+    data.setdefault("business_connections", {})
+
+    if not data.get("owner_id") and OWNER_ID_ENV:
+        try:
+            data["owner_id"] = int(OWNER_ID_ENV)
+        except ValueError:
+            log.error("OWNER_ID должен быть числом")
 
     save_data(data)
 
@@ -219,70 +231,31 @@ def load_data() -> dict[str, Any]:
 DATA = load_data()
 
 
-def save_data(
-    data: dict[str, Any] | None = None
-):
-
-    global DATA
-
-    if data is None:
-        data = DATA
-
-    temp_file = DATA_FILE.with_suffix(
-        ".tmp"
-    )
-
-    try:
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8",
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-        temp_file.replace(
-            DATA_FILE
-        )
-
-    except Exception:
-
-        log.exception(
-            "Ошибка сохранения данных"
-        )
-
-
 # =========================================================
 # OWNER
 # =========================================================
 
 def get_owner_id() -> int | None:
 
-    owner_id = DATA.get(
-        "owner_id"
-    )
+    owner_id = DATA.get("owner_id")
 
     if owner_id:
-        return int(owner_id)
+        try:
+            return int(owner_id)
+        except (TypeError, ValueError):
+            return None
 
     if OWNER_ID_ENV:
-        return int(OWNER_ID_ENV)
+        try:
+            return int(OWNER_ID_ENV)
+        except ValueError:
+            return None
 
     return None
 
 
-def is_owner(
-    user_id: int | None
-) -> bool:
-
+def is_owner(user_id: int | None) -> bool:
     owner_id = get_owner_id()
-
     return bool(
         user_id
         and owner_id
@@ -295,95 +268,59 @@ def is_owner(
 # =========================================================
 
 def moscow_now() -> datetime:
-
-    return datetime.now(
-        TIMEZONE
-    )
+    return datetime.now(TIMEZONE)
 
 
 def moscow_time_string() -> str:
-
-    return moscow_now().strftime(
-        "%d.%m.%Y %H:%M"
-    )
+    return moscow_now().strftime("%d.%m.%Y %H:%M")
 
 
 def get_schedule_context() -> str:
 
     now = moscow_now()
 
-    current_minutes = (
-        now.hour * 60
-        + now.minute
-    )
+    current_minutes = now.hour * 60 + now.minute
 
     active = []
 
-    for item in DATA.get(
-        "schedule",
-        []
-    ):
+    for item in DATA.get("schedule", []):
 
         try:
-
             start_h, start_m = map(
                 int,
-                item["start"].split(":")
+                item["start"].split(":"),
             )
 
             end_h, end_m = map(
                 int,
-                item["end"].split(":")
+                item["end"].split(":"),
             )
 
-            start = (
-                start_h * 60
-                + start_m
-            )
-
-            end = (
-                end_h * 60
-                + end_m
-            )
+            start = start_h * 60 + start_m
+            end = end_h * 60 + end_m
 
             if start <= end:
-
-                inside = (
-                    start
-                    <= current_minutes
-                    <= end
-                )
-
+                inside = start <= current_minutes <= end
             else:
-
-                # Через полночь
                 inside = (
                     current_minutes >= start
                     or current_minutes <= end
                 )
 
             if inside:
-                active.append(
-                    item
-                )
+                active.append(item)
 
         except Exception:
             continue
 
     if not active:
-
-        return (
-            "Сейчас нет активного события "
-            "в расписании владельца."
-        )
+        return "Сейчас нет активного события в расписании владельца."
 
     lines = []
 
     for item in active:
-
         lines.append(
-            f"- {item['name']} "
-            f"({item['start']}–{item['end']})"
+            f"- {item['name']} ({item['start']}–{item['end']})"
         )
 
     return (
@@ -394,14 +331,13 @@ def get_schedule_context() -> str:
 
 # =========================================================
 # SUBSCRIPTION
+# Подписка проверяется ТОЛЬКО в самом Manager.
+# Business-сообщения здесь не блокируются подпиской.
 # =========================================================
 
-async def is_subscribed(
-    user_id: int
-) -> bool:
+async def is_subscribed(user_id: int) -> bool:
 
     try:
-
         member = await bot.get_chat_member(
             chat_id=REQUIRED_CHANNEL,
             user_id=user_id,
@@ -415,7 +351,6 @@ async def is_subscribed(
             return True
 
         if member.status == "restricted":
-
             return bool(
                 getattr(
                     member,
@@ -427,16 +362,14 @@ async def is_subscribed(
         return False
 
     except Exception:
-
         log.exception(
-            "Ошибка проверки подписки: %s",
+            "Ошибка проверки подписки: user_id=%s",
             user_id,
         )
-
         return False
 
 
-def subscription_keyboard():
+def subscription_keyboard() -> InlineKeyboardMarkup:
 
     channel_url = (
         f"https://t.me/"
@@ -454,33 +387,27 @@ def subscription_keyboard():
             [
                 InlineKeyboardButton(
                     text="✅ Проверить подписку",
-                    callback_data=(
-                        "check_subscription"
-                    ),
+                    callback_data="check_subscription",
                 )
             ],
         ]
     )
 
 
-async def require_subscription(
-    message: Message
-) -> bool:
+async def require_subscription(message: Message) -> bool:
 
     user = message.from_user
 
     if not user:
         return False
 
-    if await is_subscribed(
-        user.id
-    ):
+    if await is_subscribed(user.id):
         return True
 
     await message.answer(
         "🔒 <b>Доступ ограничен</b>\n\n"
-        "Чтобы пользоваться Manager, "
-        "сначала подпишись на наш канал.\n\n"
+        "Чтобы пользоваться Manager, сначала "
+        "подпишись на наш канал.\n\n"
         "После подписки нажми "
         "«Проверить подписку».",
         parse_mode="HTML",
@@ -495,7 +422,6 @@ async def require_subscription(
 # =========================================================
 
 class SetupStates(StatesGroup):
-
     profile_field = State()
 
     fact_text = State()
@@ -510,7 +436,7 @@ class SetupStates(StatesGroup):
 
 
 # =========================================================
-# MAIN MENU
+# MENUS
 # =========================================================
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -576,17 +502,14 @@ def back_menu() -> InlineKeyboardMarkup:
 # =========================================================
 
 @dp.message(CommandStart())
-async def start(
-    message: Message
-):
+async def start(message: Message):
 
     user = message.from_user
 
     if not user:
         return
 
-    # Первый пользователь автоматически становится владельцем,
-    # если OWNER_ID ещё не установлен.
+    # Если OWNER_ID не задан, первый /start становится владельцем.
     if get_owner_id() is None:
 
         DATA["owner_id"] = user.id
@@ -598,22 +521,23 @@ async def start(
             user.id,
         )
 
-    if not await require_subscription(
-        message
-    ):
+    # Подписка действует только внутри Manager.
+    if not await require_subscription(message):
         return
 
     await message.answer(
         f"🍀 <b>Manager {MANAGER_VERSION}</b>\n\n"
         "Добро пожаловать в панель управления.\n\n"
-        "Здесь можно настроить профиль, "
-        "расписание, информацию о тебе, "
-        "товарах и проектах, а также то, "
-        "что Manager должен узнавать "
-        "у собеседников.\n\n"
-        f"🕐 МСК: <code>"
-        f"{moscow_time_string()}"
-        f"</code>",
+        "Здесь можно настроить:\n"
+        "👤 профиль и биографию\n"
+        "🕐 расписание по МСК\n"
+        "📦 товары, проекты и другую информацию\n"
+        "📋 сведения, которые нужно узнавать у собеседников\n"
+        "🎭 стиль общения\n"
+        "🧠 память о собеседниках\n\n"
+        "Business-чат работает отдельно: "
+        "проверка подписки там не выполняется.\n\n"
+        f"🕐 МСК: <code>{moscow_time_string()}</code>",
         parse_mode="HTML",
         reply_markup=main_menu(),
     )
@@ -623,18 +547,12 @@ async def start(
 # SUBSCRIPTION CALLBACK
 # =========================================================
 
-@dp.callback_query(
-    F.data == "check_subscription"
-)
-async def check_subscription(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery):
 
     user = callback.from_user
 
-    if await is_subscribed(
-        user.id
-    ):
+    if await is_subscribed(user.id):
 
         await callback.answer(
             "Подписка подтверждена ✅",
@@ -642,7 +560,6 @@ async def check_subscription(
         )
 
         if callback.message:
-
             await callback.message.edit_text(
                 f"🍀 <b>Manager {MANAGER_VERSION}</b>\n\n"
                 "Подписка подтверждена ✅\n\n"
@@ -660,19 +577,13 @@ async def check_subscription(
 
 
 # =========================================================
-# MENU MAIN
+# MAIN MENU CALLBACK
 # =========================================================
 
-@dp.callback_query(
-    F.data == "menu_main"
-)
-async def menu_main(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_main")
+async def menu_main(callback: CallbackQuery):
 
-    if not await is_subscribed(
-        callback.from_user.id
-    ):
+    if not await is_subscribed(callback.from_user.id):
         await callback.answer(
             "Сначала подпишись на канал.",
             show_alert=True,
@@ -682,7 +593,6 @@ async def menu_main(
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             f"🍀 <b>Manager {MANAGER_VERSION}</b>\n\n"
             "⚙️ <b>Панель управления</b>\n\n"
@@ -702,18 +612,18 @@ def profile_text() -> str:
 
     return (
         "👤 <b>Мой профиль</b>\n\n"
-        f"Имя: {p['name'] or '—'}\n"
-        f"Возраст: {p['age'] or '—'}\n"
-        f"Город: {p['city'] or '—'}\n"
-        f"Работа: {p['work'] or '—'}\n"
-        f"Учёба: {p['education'] or '—'}\n"
-        f"Интересы: {p['interests'] or '—'}\n"
-        f"О себе: {p['about'] or '—'}\n"
-        f"Дополнительно: {p['extra'] or '—'}"
+        f"Имя: {p.get('name') or '—'}\n"
+        f"Возраст: {p.get('age') or '—'}\n"
+        f"Город: {p.get('city') or '—'}\n"
+        f"Работа: {p.get('work') or '—'}\n"
+        f"Учёба: {p.get('education') or '—'}\n"
+        f"Интересы: {p.get('interests') or '—'}\n"
+        f"О себе: {p.get('about') or '—'}\n"
+        f"Дополнительно: {p.get('extra') or '—'}"
     )
 
 
-def profile_menu():
+def profile_menu() -> InlineKeyboardMarkup:
 
     fields = [
         ("Имя", "name"),
@@ -729,14 +639,11 @@ def profile_menu():
     buttons = []
 
     for title, key in fields:
-
         buttons.append(
             [
                 InlineKeyboardButton(
                     text=f"✏️ {title}",
-                    callback_data=(
-                        f"profile_edit:{key}"
-                    ),
+                    callback_data=f"profile_edit:{key}",
                 )
             ]
         )
@@ -750,22 +657,15 @@ def profile_menu():
         ]
     )
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@dp.callback_query(
-    F.data == "menu_profile"
-)
-async def menu_profile(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_profile")
+async def menu_profile(callback: CallbackQuery):
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             profile_text(),
             parse_mode="HTML",
@@ -773,26 +673,16 @@ async def menu_profile(
         )
 
 
-@dp.callback_query(
-    F.data.startswith("profile_edit:")
-)
+@dp.callback_query(F.data.startswith("profile_edit:"))
 async def profile_edit(
     callback: CallbackQuery,
     state: FSMContext,
 ):
 
-    field = callback.data.split(
-        ":",
-        1
-    )[1]
+    field = callback.data.split(":", 1)[1]
 
-    await state.update_data(
-        profile_field=field
-    )
-
-    await state.set_state(
-        SetupStates.profile_field
-    )
+    await state.update_data(profile_field=field)
+    await state.set_state(SetupStates.profile_field)
 
     names = {
         "name": "имя",
@@ -808,7 +698,6 @@ async def profile_edit(
     await callback.answer()
 
     if callback.message:
-
         await callback.message.answer(
             f"✏️ Напиши {names.get(field, field)}.\n\n"
             "Можно отправить несколько слов или "
@@ -816,9 +705,7 @@ async def profile_edit(
         )
 
 
-@dp.message(
-    SetupStates.profile_field
-)
+@dp.message(SetupStates.profile_field)
 async def profile_save(
     message: Message,
     state: FSMContext,
@@ -826,12 +713,9 @@ async def profile_save(
 
     data = await state.get_data()
 
-    field = data.get(
-        "profile_field"
-    )
+    field = data.get("profile_field")
 
-    if field:
-
+    if field in DATA["profile"]:
         DATA["profile"][field] = (
             message.text or ""
         ).strip()
@@ -847,27 +731,20 @@ async def profile_save(
 
 
 # =========================================================
-# FACTS / PRODUCTS
+# FACTS
 # =========================================================
 
 def facts_text() -> str:
 
-    facts = DATA.get(
-        "facts",
-        []
-    )
+    facts = DATA.get("facts", [])
 
     if not facts:
-
         return (
             "📦 <b>Информация</b>\n\n"
             "Пока ничего не добавлено."
         )
 
-    lines = [
-        f"• {fact}"
-        for fact in facts
-    ]
+    lines = [f"• {fact}" for fact in facts]
 
     return (
         "📦 <b>Информация</b>\n\n"
@@ -875,7 +752,7 @@ def facts_text() -> str:
     )
 
 
-def facts_menu():
+def facts_menu() -> InlineKeyboardMarkup:
 
     buttons = [
         [
@@ -886,17 +763,12 @@ def facts_menu():
         ]
     ]
 
-    for index, fact in enumerate(
-        DATA.get("facts", [])
-    ):
-
+    for index, fact in enumerate(DATA.get("facts", [])):
         buttons.append(
             [
                 InlineKeyboardButton(
                     text=f"🗑 {fact[:35]}",
-                    callback_data=(
-                        f"fact_delete:{index}"
-                    ),
+                    callback_data=f"fact_delete:{index}",
                 )
             ]
         )
@@ -910,22 +782,15 @@ def facts_menu():
         ]
     )
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@dp.callback_query(
-    F.data == "menu_facts"
-)
-async def menu_facts(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_facts")
+async def menu_facts(callback: CallbackQuery):
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             facts_text(),
             parse_mode="HTML",
@@ -933,22 +798,17 @@ async def menu_facts(
         )
 
 
-@dp.callback_query(
-    F.data == "fact_add"
-)
+@dp.callback_query(F.data == "fact_add")
 async def fact_add(
     callback: CallbackQuery,
     state: FSMContext,
 ):
 
-    await state.set_state(
-        SetupStates.fact_text
-    )
+    await state.set_state(SetupStates.fact_text)
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.answer(
             "📦 Напиши информацию, которую Manager "
             "должен знать.\n\n"
@@ -959,24 +819,16 @@ async def fact_add(
         )
 
 
-@dp.message(
-    SetupStates.fact_text
-)
+@dp.message(SetupStates.fact_text)
 async def fact_save(
     message: Message,
     state: FSMContext,
 ):
 
-    text = (
-        message.text or ""
-    ).strip()
+    text = (message.text or "").strip()
 
     if text:
-
-        DATA["facts"].append(
-            text
-        )
-
+        DATA["facts"].append(text)
         save_data()
 
     await state.clear()
@@ -987,36 +839,24 @@ async def fact_save(
     )
 
 
-@dp.callback_query(
-    F.data.startswith("fact_delete:")
-)
-async def fact_delete(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data.startswith("fact_delete:"))
+async def fact_delete(callback: CallbackQuery):
 
-    index = int(
-        callback.data.split(
-            ":"
-        )[1]
-    )
+    try:
+        index = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка")
+        return
 
-    facts = DATA.get(
-        "facts",
-        []
-    )
+    facts = DATA.get("facts", [])
 
     if 0 <= index < len(facts):
-
         facts.pop(index)
-
         save_data()
 
-    await callback.answer(
-        "Удалено"
-    )
+    await callback.answer("Удалено")
 
     if callback.message:
-
         await callback.message.edit_text(
             facts_text(),
             parse_mode="HTML",
@@ -1030,13 +870,9 @@ async def fact_delete(
 
 def schedule_text() -> str:
 
-    schedule = DATA.get(
-        "schedule",
-        []
-    )
+    schedule = DATA.get("schedule", [])
 
     if not schedule:
-
         return (
             "🕐 <b>Расписание</b>\n\n"
             "Пока расписание пустое.\n\n"
@@ -1046,7 +882,6 @@ def schedule_text() -> str:
     lines = []
 
     for item in schedule:
-
         lines.append(
             f"• <b>{item['name']}</b> — "
             f"{item['start']}–{item['end']}"
@@ -1055,12 +890,11 @@ def schedule_text() -> str:
     return (
         "🕐 <b>Расписание</b>\n\n"
         + "\n".join(lines)
-        + "\n\n"
-        "Время: МСК (UTC+3)"
+        + "\n\nВремя: МСК (UTC+3)"
     )
 
 
-def schedule_menu():
+def schedule_menu() -> InlineKeyboardMarkup:
 
     buttons = [
         [
@@ -1071,10 +905,7 @@ def schedule_menu():
         ]
     ]
 
-    for index, item in enumerate(
-        DATA.get("schedule", [])
-    ):
-
+    for index, item in enumerate(DATA.get("schedule", [])):
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -1082,9 +913,7 @@ def schedule_menu():
                         f"🗑 {item['name']} "
                         f"{item['start']}–{item['end']}"
                     ),
-                    callback_data=(
-                        f"schedule_delete:{index}"
-                    ),
+                    callback_data=f"schedule_delete:{index}",
                 )
             ]
         )
@@ -1098,22 +927,15 @@ def schedule_menu():
         ]
     )
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@dp.callback_query(
-    F.data == "menu_schedule"
-)
-async def menu_schedule(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_schedule")
+async def menu_schedule(callback: CallbackQuery):
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             schedule_text(),
             parse_mode="HTML",
@@ -1121,22 +943,17 @@ async def menu_schedule(
         )
 
 
-@dp.callback_query(
-    F.data == "schedule_add"
-)
+@dp.callback_query(F.data == "schedule_add")
 async def schedule_add(
     callback: CallbackQuery,
     state: FSMContext,
 ):
 
-    await state.set_state(
-        SetupStates.schedule_name
-    )
+    await state.set_state(SetupStates.schedule_name)
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.answer(
             "🕐 Название события?\n\n"
             "Например: работа, сон, спорт, "
@@ -1144,23 +961,21 @@ async def schedule_add(
         )
 
 
-@dp.message(
-    SetupStates.schedule_name
-)
+@dp.message(SetupStates.schedule_name)
 async def schedule_name(
     message: Message,
     state: FSMContext,
 ):
 
-    await state.update_data(
-        schedule_name=(
-            message.text or ""
-        ).strip()
-    )
+    name = (message.text or "").strip()
 
-    await state.set_state(
-        SetupStates.schedule_start
-    )
+    if not name:
+        await message.answer("Напиши название события.")
+        return
+
+    await state.update_data(schedule_name=name)
+
+    await state.set_state(SetupStates.schedule_start)
 
     await message.answer(
         "Теперь напиши время начала.\n\n"
@@ -1169,41 +984,26 @@ async def schedule_name(
     )
 
 
-@dp.message(
-    SetupStates.schedule_start
-)
+@dp.message(SetupStates.schedule_start)
 async def schedule_start(
     message: Message,
     state: FSMContext,
 ):
 
-    text = (
-        message.text or ""
-    ).strip()
+    text = (message.text or "").strip()
 
     try:
-
-        datetime.strptime(
-            text,
-            "%H:%M"
-        )
-
+        datetime.strptime(text, "%H:%M")
     except ValueError:
-
         await message.answer(
             "❌ Неверный формат.\n"
             "Используй, например: 18:00"
         )
-
         return
 
-    await state.update_data(
-        schedule_start=text
-    )
+    await state.update_data(schedule_start=text)
 
-    await state.set_state(
-        SetupStates.schedule_end
-    )
+    await state.set_state(SetupStates.schedule_end)
 
     await message.answer(
         "Теперь время окончания.\n\n"
@@ -1212,46 +1012,29 @@ async def schedule_start(
     )
 
 
-@dp.message(
-    SetupStates.schedule_end
-)
+@dp.message(SetupStates.schedule_end)
 async def schedule_end(
     message: Message,
     state: FSMContext,
 ):
 
-    text = (
-        message.text or ""
-    ).strip()
+    text = (message.text or "").strip()
 
     try:
-
-        datetime.strptime(
-            text,
-            "%H:%M"
-        )
-
+        datetime.strptime(text, "%H:%M")
     except ValueError:
-
         await message.answer(
             "❌ Неверный формат.\n"
             "Используй, например: 23:00"
         )
-
         return
 
     data = await state.get_data()
 
     DATA["schedule"].append(
         {
-            "name": data.get(
-                "schedule_name",
-                "Событие",
-            ),
-            "start": data.get(
-                "schedule_start",
-                "00:00",
-            ),
+            "name": data.get("schedule_name", "Событие"),
+            "start": data.get("schedule_start", "00:00"),
             "end": text,
         }
     )
@@ -1266,38 +1049,24 @@ async def schedule_end(
     )
 
 
-@dp.callback_query(
-    F.data.startswith(
-        "schedule_delete:"
-    )
-)
-async def schedule_delete(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data.startswith("schedule_delete:"))
+async def schedule_delete(callback: CallbackQuery):
 
-    index = int(
-        callback.data.split(
-            ":"
-        )[1]
-    )
+    try:
+        index = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка")
+        return
 
-    schedule = DATA.get(
-        "schedule",
-        []
-    )
+    schedule = DATA.get("schedule", [])
 
     if 0 <= index < len(schedule):
-
         schedule.pop(index)
-
         save_data()
 
-    await callback.answer(
-        "Удалено"
-    )
+    await callback.answer("Удалено")
 
     if callback.message:
-
         await callback.message.edit_text(
             schedule_text(),
             parse_mode="HTML",
@@ -1311,25 +1080,17 @@ async def schedule_delete(
 
 def questions_text() -> str:
 
-    questions = DATA.get(
-        "questions",
-        []
-    )
+    questions = DATA.get("questions", [])
 
     if not questions:
-
         return (
             "📋 <b>Что узнавать</b>\n\n"
             "Список пуст.\n\n"
             "Добавь сведения, которые Manager "
-            "должен естественно узнавать "
-            "в разговоре."
+            "должен естественно узнавать в разговоре."
         )
 
-    lines = [
-        f"• {q}"
-        for q in questions
-    ]
+    lines = [f"• {q}" for q in questions]
 
     return (
         "📋 <b>Что узнавать у собеседника</b>\n\n"
@@ -1337,7 +1098,7 @@ def questions_text() -> str:
     )
 
 
-def questions_menu():
+def questions_menu() -> InlineKeyboardMarkup:
 
     buttons = [
         [
@@ -1348,17 +1109,12 @@ def questions_menu():
         ]
     ]
 
-    for index, question in enumerate(
-        DATA.get("questions", [])
-    ):
-
+    for index, question in enumerate(DATA.get("questions", [])):
         buttons.append(
             [
                 InlineKeyboardButton(
                     text=f"🗑 {question[:35]}",
-                    callback_data=(
-                        f"question_delete:{index}"
-                    ),
+                    callback_data=f"question_delete:{index}",
                 )
             ]
         )
@@ -1372,22 +1128,15 @@ def questions_menu():
         ]
     )
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@dp.callback_query(
-    F.data == "menu_questions"
-)
-async def menu_questions(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_questions")
+async def menu_questions(callback: CallbackQuery):
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             questions_text(),
             parse_mode="HTML",
@@ -1395,22 +1144,17 @@ async def menu_questions(
         )
 
 
-@dp.callback_query(
-    F.data == "question_add"
-)
+@dp.callback_query(F.data == "question_add")
 async def question_add(
     callback: CallbackQuery,
     state: FSMContext,
 ):
 
-    await state.set_state(
-        SetupStates.question_text
-    )
+    await state.set_state(SetupStates.question_text)
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.answer(
             "📋 Что Manager должен узнать?\n\n"
             "Например:\n"
@@ -1423,24 +1167,16 @@ async def question_add(
         )
 
 
-@dp.message(
-    SetupStates.question_text
-)
+@dp.message(SetupStates.question_text)
 async def question_save(
     message: Message,
     state: FSMContext,
 ):
 
-    text = (
-        message.text or ""
-    ).strip()
+    text = (message.text or "").strip()
 
     if text:
-
-        DATA["questions"].append(
-            text
-        )
-
+        DATA["questions"].append(text)
         save_data()
 
     await state.clear()
@@ -1451,38 +1187,24 @@ async def question_save(
     )
 
 
-@dp.callback_query(
-    F.data.startswith(
-        "question_delete:"
-    )
-)
-async def question_delete(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data.startswith("question_delete:"))
+async def question_delete(callback: CallbackQuery):
 
-    index = int(
-        callback.data.split(
-            ":"
-        )[1]
-    )
+    try:
+        index = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка")
+        return
 
-    questions = DATA.get(
-        "questions",
-        []
-    )
+    questions = DATA.get("questions", [])
 
     if 0 <= index < len(questions):
-
         questions.pop(index)
-
         save_data()
 
-    await callback.answer(
-        "Удалено"
-    )
+    await callback.answer("Удалено")
 
     if callback.message:
-
         await callback.message.edit_text(
             questions_text(),
             parse_mode="HTML",
@@ -1500,13 +1222,13 @@ def style_text() -> str:
 
     return (
         "🎭 <b>Стиль общения</b>\n\n"
-        f"Стиль: {settings['style']}\n"
-        f"Длина: {settings['default_length']}\n"
-        f"Эмодзи: {settings['emoji_level']}"
+        f"Стиль: {settings.get('style', '—')}\n"
+        f"Длина: {settings.get('default_length', 'short')}\n"
+        f"Эмодзи: {settings.get('emoji_level', 'normal')}"
     )
 
 
-def style_menu():
+def style_menu() -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1552,17 +1274,12 @@ def style_menu():
     )
 
 
-@dp.callback_query(
-    F.data == "menu_style"
-)
-async def menu_style(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_style")
+async def menu_style(callback: CallbackQuery):
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             style_text(),
             parse_mode="HTML",
@@ -1570,45 +1287,37 @@ async def menu_style(
         )
 
 
-@dp.callback_query(
-    F.data == "style_edit"
-)
+@dp.callback_query(F.data == "style_edit")
 async def style_edit(
     callback: CallbackQuery,
     state: FSMContext,
 ):
 
-    await state.set_state(
-        SetupStates.style_text
-    )
+    await state.set_state(SetupStates.style_text)
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.answer(
             "🎭 Опиши желаемый стиль.\n\n"
             "Например:\n"
-            "«Пиши максимально естественно, "
-            "немного с юмором, без официоза, "
-            "иногда используй сленг, но не "
-            "перебарщивай.»"
+            "«Пиши максимально естественно, немного "
+            "с юмором, без официоза, иногда используй "
+            "сленг, но не перебарщивай.»"
         )
 
 
-@dp.message(
-    SetupStates.style_text
-)
+@dp.message(SetupStates.style_text)
 async def style_save(
     message: Message,
     state: FSMContext,
 ):
 
-    DATA["settings"]["style"] = (
-        message.text or ""
-    ).strip()
+    text = (message.text or "").strip()
 
-    save_data()
+    if text:
+        DATA["settings"]["style"] = text
+        save_data()
 
     await state.clear()
 
@@ -1618,17 +1327,10 @@ async def style_save(
     )
 
 
-@dp.callback_query(
-    F.data.startswith("length_")
-)
-async def set_length(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data.startswith("length_"))
+async def set_length(callback: CallbackQuery):
 
-    value = callback.data.replace(
-        "length_",
-        ""
-    )
+    value = callback.data.replace("length_", "")
 
     values = {
         "short": "short",
@@ -1636,21 +1338,16 @@ async def set_length(
         "auto": "auto",
     }
 
-    DATA["settings"][
-        "default_length"
-    ] = values.get(
+    DATA["settings"]["default_length"] = values.get(
         value,
         "short",
     )
 
     save_data()
 
-    await callback.answer(
-        "Настройка сохранена"
-    )
+    await callback.answer("Настройка сохранена")
 
     if callback.message:
-
         await callback.message.edit_text(
             style_text(),
             parse_mode="HTML",
@@ -1658,30 +1355,18 @@ async def set_length(
         )
 
 
-@dp.callback_query(
-    F.data.startswith("emoji_")
-)
-async def set_emoji(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data.startswith("emoji_"))
+async def set_emoji(callback: CallbackQuery):
 
-    value = callback.data.replace(
-        "emoji_",
-        ""
-    )
+    value = callback.data.replace("emoji_", "")
 
-    DATA["settings"][
-        "emoji_level"
-    ] = value
+    DATA["settings"]["emoji_level"] = value
 
     save_data()
 
-    await callback.answer(
-        "Настройка сохранена"
-    )
+    await callback.answer("Настройка сохранена")
 
     if callback.message:
-
         await callback.message.edit_text(
             style_text(),
             parse_mode="HTML",
@@ -1693,42 +1378,27 @@ async def set_emoji(
 # MEMORY
 # =========================================================
 
-@dp.callback_query(
-    F.data == "menu_memory"
-)
-async def menu_memory(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_memory")
+async def menu_memory(callback: CallbackQuery):
 
-    contacts = DATA.get(
-        "contacts",
-        {}
-    )
+    contacts = DATA.get("contacts", {})
 
     if not contacts:
-
         text = (
             "🧠 <b>Память</b>\n\n"
             "Пока Manager ничего не сохранил "
             "о собеседниках."
         )
-
     else:
-
         lines = []
 
         for chat_id, contact in contacts.items():
-
             name = (
-                contact.get(
-                    "name"
-                )
+                contact.get("name")
                 or f"Chat {chat_id}"
             )
 
-            lines.append(
-                f"• {name}"
-            )
+            lines.append(f"• {name}")
 
         text = (
             "🧠 <b>Память</b>\n\n"
@@ -1738,7 +1408,6 @@ async def menu_memory(
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             text,
             parse_mode="HTML",
@@ -1750,18 +1419,18 @@ async def menu_memory(
 # STATUS
 # =========================================================
 
-@dp.callback_query(
-    F.data == "menu_status"
-)
-async def menu_status(
-    callback: CallbackQuery
-):
+@dp.callback_query(F.data == "menu_status")
+async def menu_status(callback: CallbackQuery):
+
+    connections = DATA.get(
+        "business_connections",
+        {},
+    )
 
     enabled = sum(
         1
-        for connection
-        in business_connections.values()
-        if connection.is_enabled
+        for connection in connections.values()
+        if connection.get("enabled")
     )
 
     owner = get_owner_id()
@@ -1773,13 +1442,12 @@ async def menu_status(
         f"👤 Owner ID: <code>{owner or '—'}</code>\n"
         f"🕐 МСК: <code>{moscow_time_string()}</code>\n"
         f"💾 Data: <code>{DATA_FILE}</code>\n"
-        f"🧠 Диалогов: {len(DATA['history'])}"
+        f"🧠 Диалогов: {len(DATA.get('history', {}))}"
     )
 
     await callback.answer()
 
     if callback.message:
-
         await callback.message.edit_text(
             text,
             parse_mode="HTML",
@@ -1789,40 +1457,26 @@ async def menu_status(
 
 # =========================================================
 # BUSINESS CONNECTION
+# ВАЖНО: здесь НЕТ проверки подписки.
 # =========================================================
 
 @dp.business_connection()
 async def handle_business_connection(
-    connection: BusinessConnection
+    connection: BusinessConnection,
 ):
 
     log.info(
         "BUSINESS CONNECTION | "
-        "id=%s | "
-        "user=%s | "
-        "enabled=%s | "
-        "can_reply=%s",
+        "id=%s | user=%s | enabled=%s | can_reply=%s",
         connection.id,
-        connection.user.id
-        if connection.user
-        else "?",
+        connection.user.id if connection.user else "?",
         connection.is_enabled,
         connection.can_reply,
     )
 
-    # Не применяем подписку здесь.
-    # Business работает независимо от подписки.
+    DATA.setdefault("business_connections", {})
 
-    # Сохраняем состояние в памяти
-    # через специальный раздел.
-    DATA.setdefault(
-        "business_connections",
-        {}
-    )
-
-    DATA["business_connections"][
-        connection.id
-    ] = {
+    DATA["business_connections"][connection.id] = {
         "user_id": (
             connection.user.id
             if connection.user
@@ -1840,19 +1494,11 @@ async def handle_business_connection(
 # =========================================================
 
 @dp.business_message()
-async def handle_business_message(
-    message: Message
-):
+async def handle_business_message(message: Message):
 
-    connection_id = (
-        message.business_connection_id
-    )
-
+    connection_id = message.business_connection_id
     chat_id = message.chat.id
-
-    text = (
-        message.text or ""
-    ).strip()
+    text = (message.text or "").strip()
 
     if not connection_id:
         return
@@ -1861,32 +1507,24 @@ async def handle_business_message(
         return
 
     log.info(
-        "BUSINESS MESSAGE | "
-        "chat=%s | text=%r",
+        "BUSINESS MESSAGE | chat=%s | text=%r",
         chat_id,
         text,
     )
 
     # -----------------------------------------------------
-    # Получаем connection
+    # Получаем актуальный Business Connection.
     # -----------------------------------------------------
 
     try:
-
-        connection = (
-            await bot.get_business_connection(
-                business_connection_id=(
-                    connection_id
-                )
-            )
+        connection = await bot.get_business_connection(
+            business_connection_id=connection_id,
         )
 
     except Exception:
-
         log.exception(
             "Не удалось получить Business Connection"
         )
-
         return
 
     if not connection.is_enabled:
@@ -1896,7 +1534,7 @@ async def handle_business_message(
         return
 
     # -----------------------------------------------------
-    # Владелец не получает автоответ сам себе
+    # Не отвечаем владельцу самому себе.
     # -----------------------------------------------------
 
     owner_id = (
@@ -1910,25 +1548,19 @@ async def handle_business_message(
         and owner_id
         and message.from_user.id == owner_id
     ):
-
         return
 
     # -----------------------------------------------------
-    # История
+    # История.
     # -----------------------------------------------------
 
-    history = DATA.setdefault(
-        "history",
-        {}
-    )
+    history = DATA.setdefault("history", {})
 
-    chat_key = str(
-        chat_id
-    )
+    chat_key = str(chat_id)
 
     chat_history = history.setdefault(
         chat_key,
-        []
+        [],
     )
 
     chat_history.append(
@@ -1943,13 +1575,10 @@ async def handle_business_message(
     ]
 
     # -----------------------------------------------------
-    # Контакт
+    # Контакт.
     # -----------------------------------------------------
 
-    contacts = DATA.setdefault(
-        "contacts",
-        {}
-    )
+    contacts = DATA.setdefault("contacts", {})
 
     contact = contacts.setdefault(
         chat_key,
@@ -1964,7 +1593,6 @@ async def handle_business_message(
     if message.from_user:
 
         if message.from_user.username:
-
             contact["username"] = (
                 "@"
                 + message.from_user.username
@@ -1974,25 +1602,33 @@ async def handle_business_message(
             not contact["name"]
             and message.from_user.full_name
         ):
-
             contact["name"] = (
                 message.from_user.full_name
             )
 
     # -----------------------------------------------------
-    # Профиль владельца
+    # Профиль владельца.
     # -----------------------------------------------------
 
     profile = DATA["profile"]
 
     profile_lines = []
 
+    profile_labels = {
+        "name": "Имя",
+        "age": "Возраст",
+        "city": "Город",
+        "work": "Работа",
+        "education": "Учёба",
+        "interests": "Интересы",
+        "about": "О себе",
+        "extra": "Дополнительно",
+    }
+
     for key, value in profile.items():
-
         if value:
-
             profile_lines.append(
-                f"{key}: {value}"
+                f"{profile_labels.get(key, key)}: {value}"
             )
 
     profile_context = (
@@ -2002,13 +1638,10 @@ async def handle_business_message(
     )
 
     # -----------------------------------------------------
-    # Информация / товары
+    # Информация / товары / проекты.
     # -----------------------------------------------------
 
-    facts = DATA.get(
-        "facts",
-        []
-    )
+    facts = DATA.get("facts", [])
 
     facts_context = (
         "\n".join(
@@ -2016,18 +1649,14 @@ async def handle_business_message(
             for fact in facts
         )
         if facts
-        else
-        "Дополнительной информации нет."
+        else "Дополнительной информации нет."
     )
 
     # -----------------------------------------------------
-    # Что узнать
+    # Что узнать.
     # -----------------------------------------------------
 
-    questions = DATA.get(
-        "questions",
-        []
-    )
+    questions = DATA.get("questions", [])
 
     questions_context = (
         "\n".join(
@@ -2035,44 +1664,33 @@ async def handle_business_message(
             for question in questions
         )
         if questions
-        else
-        "Специальных сведений собирать не нужно."
+        else "Специальных сведений собирать не нужно."
     )
 
     # -----------------------------------------------------
-    # Уже известные данные
+    # Уже известные сведения.
     # -----------------------------------------------------
 
-    known_facts = contact.get(
-        "facts",
-        {}
-    )
+    known_facts = contact.get("facts", {})
 
     known_context = (
         "\n".join(
             f"- {key}: {value}"
-            for key, value
-            in known_facts.items()
+            for key, value in known_facts.items()
         )
         if known_facts
-        else
-        "Пока ничего дополнительного не известно."
+        else "Пока ничего дополнительного не известно."
     )
 
     # -----------------------------------------------------
-    # Время
+    # Время.
     # -----------------------------------------------------
 
-    current_time = (
-        moscow_time_string()
-    )
-
-    schedule_context = (
-        get_schedule_context()
-    )
+    current_time = moscow_time_string()
+    schedule_context = get_schedule_context()
 
     # -----------------------------------------------------
-    # Длина
+    # Длина ответа.
     # -----------------------------------------------------
 
     length = DATA["settings"].get(
@@ -2081,27 +1699,19 @@ async def handle_business_message(
     )
 
     if length == "short":
-
         length_instruction = (
-            "Обычно отвечай коротко."
+            "Обычно отвечай коротко и естественно."
         )
-
     elif length == "medium":
-
         length_instruction = (
-            "Обычно отвечай 2–5 предложениями."
+            "Обычно отвечай примерно 2–5 предложениями."
         )
-
     else:
-
         length_instruction = (
-            "Длину выбирай естественно."
+            "Длину ответа выбирай естественно."
         )
 
-    # -----------------------------------------------------
-    # Пользователь просит подробный ответ?
-    # -----------------------------------------------------
-
+    # Если человек сам просит большой ответ.
     long_request_words = [
         "подробнее",
         "подробно",
@@ -2114,23 +1724,26 @@ async def handle_business_message(
         "развернуто",
         "развёрнуто",
         "максимально подробно",
+        "можешь расписать",
+        "можешь объяснить подробнее",
     ]
 
+    text_lower = text.lower()
+
     wants_long = any(
-        word in text.lower()
-        for word in long_request_words
+        phrase in text_lower
+        for phrase in long_request_words
     )
 
     if wants_long:
-
         length_instruction = (
-            "Собеседник явно просит подробный "
-            "ответ. Можно ответить значительно "
-            "длиннее обычного."
+            "Собеседник явно попросил подробный ответ. "
+            "Можно отвечать значительно длиннее обычного "
+            "и раскрыть тему полностью."
         )
 
     # -----------------------------------------------------
-    # Стиль
+    # Стиль.
     # -----------------------------------------------------
 
     style = DATA["settings"].get(
@@ -2144,17 +1757,18 @@ async def handle_business_message(
     )
 
     # -----------------------------------------------------
-    # SYSTEM PROMPT
+    # SYSTEM PROMPT.
     # -----------------------------------------------------
 
     system_prompt = f"""
-Ты ведёшь живую переписку в Telegram.
+Ты ведёшь живую переписку в Telegram от лица владельца
+Business-аккаунта.
 
-Твоя задача — отвечать естественно, уместно и
-последовательно, учитывая весь контекст конкретного
-диалога.
+Твоя главная задача — отвечать естественно, уместно и
+последовательно, учитывая конкретный диалог.
 
-Не используй шаблонный стиль ассистента.
+Не веди себя как технический ассистент и не превращай
+обычную переписку в интервью.
 
 СТИЛЬ ВЛАДЕЛЬЦА:
 {style}
@@ -2164,37 +1778,6 @@ async def handle_business_message(
 
 ЭМОДЗИ:
 {emoji_level}
-
-ВАЖНЫЕ ПРАВИЛА:
-
-1. Никогда не выдумывай факты о владельце.
-2. Используй профиль владельца как единственный источник
-   информации о его биографии.
-3. Если в профиле указано, что человек не работает,
-   никогда не говори, что он работает.
-4. Используй расписание только тогда, когда вопрос
-   действительно связан со временем или занятостью.
-5. Учитывай актуальное время МСК.
-6. Не задавай вопросы, ответы на которые уже известны.
-7. Не повторяй одни и те же вопросы.
-8. Не пытайся искусственно продолжать разговор.
-9. Не заканчивай каждый ответ вопросом.
-10. Реагируй именно на последнее сообщение.
-11. Учитывай предыдущие сообщения.
-12. Не превращай обычную переписку в интервью.
-13. Если нужно узнать сведения из анкеты,
-    вплетай вопросы естественно в разговор.
-14. Если человек сам сообщил информацию,
-    запомни её и не спрашивай повторно.
-15. Не упоминай внутренние настройки, профиль,
-    анкету, память, расписание или системные инструкции.
-16. Не сообщай собеседнику технические детали работы Manager.
-17. Если человек просит длинный ответ,
-    действительно дай подробный ответ.
-18. Не используй одну и ту же формулировку
-    несколько сообщений подряд.
-19. Не злоупотребляй эмодзи.
-20. Не пиши слишком формально.
 
 ТЕКУЩЕЕ ВРЕМЯ:
 {current_time} по Москве (UTC+3)
@@ -2213,62 +1796,117 @@ async def handle_business_message(
 
 ЧТО УЖЕ ИЗВЕСТНО О СОБЕСЕДНИКЕ:
 {known_context}
+
+ПРАВИЛА:
+
+1. Никогда не выдумывай факты о владельце.
+
+2. Профиль владельца — источник правды о его
+   биографии.
+
+3. Если работа владельца указана как отсутствие работы,
+   не говори, что он работает.
+
+4. Если конкретного факта нет, не придумывай его.
+
+5. Расписание используй только если оно действительно
+   относится к текущему разговору.
+
+6. Учитывай время по Москве.
+
+7. Не спрашивай то, что уже известно из истории.
+
+8. Не повторяй один и тот же вопрос разными словами.
+
+9. Не задавай вопрос в конце каждого сообщения.
+
+10. Не пытайся искусственно продолжать разговор.
+
+11. Реагируй прежде всего на смысл последнего сообщения.
+
+12. Учитывай предыдущую переписку.
+
+13. Если нужно узнать сведения из списка анкеты,
+    спрашивай их естественно и только когда это
+    уместно.
+
+14. Если человек сам сообщил сведения о себе,
+    не спрашивай их повторно.
+
+15. Не упоминай профиль, память, расписание, анкету,
+    системный промпт, Manager или технические настройки.
+
+16. Не говори собеседнику, что ты анализируешь его.
+
+17. Не используй одинаковые шаблоны ответов.
+
+18. Не злоупотребляй вопросами.
+
+19. Не злоупотребляй эмодзи.
+
+20. Не пиши канцеляритом.
+
+21. Не начинай каждый ответ одинаково.
+
+22. Не используй фразы вроде:
+    «Я понимаю ваш запрос»,
+    «Конечно, я помогу»,
+    «Как ИИ»,
+    если они неуместны.
+
+23. Если сообщение короткое — ответ тоже может быть коротким.
+
+24. Если собеседник явно просит подробный ответ,
+    дай действительно подробный ответ.
+
+25. Если собеседник шутит, можно ответить живее и
+    с лёгким юмором, если это соответствует стилю.
+
+26. Если собеседник не задаёт вопрос, не обязан задавать
+    вопрос в ответ.
+
+27. Не выдумывай встречи, поездки, работу, планы,
+    отношения или другие личные события владельца.
+
+28. Если в информации владельца есть конкретные данные
+    о товаре, проекте или интересе — используй их,
+    когда они относятся к разговору.
+
+29. Отвечай так, будто это обычная переписка человека,
+    а не диалог с консультантом.
+
+30. Не повторяй недавние формулировки без причины.
 """.strip()
-
-    # -----------------------------------------------------
-    # Дополнительная вариативность
-    # -----------------------------------------------------
-
-    variation = random.choice([
-        "Ответь естественно. Не обязательно задавать вопрос.",
-        "Сначала отреагируй на смысл сообщения.",
-        "Не используй шаблонную формулировку.",
-        "Если вопрос не нужен, просто отреагируй.",
-        "Учитывай предыдущий контекст.",
-        "Пиши так, как продолжился бы обычный чат.",
-        "Не повторяй недавно использованные формулировки.",
-        "Не пытайся специально сделать разговор длиннее.",
-    ])
 
     messages = [
         {
             "role": "system",
             "content": system_prompt,
         },
-
         *chat_history,
-
-        {
-            "role": "system",
-            "content": variation,
-        },
     ]
 
     # -----------------------------------------------------
-    # GROQ
+    # GROQ.
     # -----------------------------------------------------
 
     reply_text = ""
 
-    for attempt in range(
-        MAX_RETRIES + 1
-    ):
+    for attempt in range(MAX_RETRIES + 1):
 
         try:
-
             log.info(
-                "GROQ REQUEST | chat=%s | attempt=%s",
+                "GROQ REQUEST | chat=%s | attempt=%s | model=%s",
                 chat_id,
                 attempt + 1,
+                MODEL,
             )
 
-            response = (
-                await groq.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    max_tokens=MAX_REPLY_TOKENS,
-                    temperature=1.0,
-                )
+            response = await groq.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                max_tokens=MAX_REPLY_TOKENS,
+                temperature=0.85,
             )
 
             reply_text = (
@@ -2281,34 +1919,28 @@ async def handle_business_message(
                 break
 
         except Exception:
-
             log.exception(
                 "Groq request failed | attempt=%s",
                 attempt + 1,
             )
 
             if attempt < MAX_RETRIES:
-
-                await asyncio.sleep(
-                    1.0
-                )
+                await asyncio.sleep(1.0)
 
     # -----------------------------------------------------
-    # Если Groq не ответил
+    # Если Groq не ответил:
+    # ничего технического человеку не отправляем.
     # -----------------------------------------------------
 
     if not reply_text:
-
         log.error(
-            "Groq не вернул ответ после всех попыток."
+            "Groq не вернул ответ после всех попыток. "
+            "Пользователю ничего не отправляем."
         )
-
-        # Ничего технического пользователю
-        # не отправляем.
         return
 
     # -----------------------------------------------------
-    # История
+    # История.
     # -----------------------------------------------------
 
     chat_history.append(
@@ -2323,13 +1955,13 @@ async def handle_business_message(
     ]
 
     # -----------------------------------------------------
-    # Сохраняем
+    # Сохранение.
     # -----------------------------------------------------
 
     save_data()
 
     # -----------------------------------------------------
-    # SEND
+    # Отправка от Business-аккаунта.
     # -----------------------------------------------------
 
     try:
@@ -2337,9 +1969,7 @@ async def handle_business_message(
         await bot.send_message(
             chat_id=chat_id,
             text=reply_text,
-            business_connection_id=(
-                connection_id
-            ),
+            business_connection_id=connection_id,
         )
 
         log.info(
@@ -2348,7 +1978,6 @@ async def handle_business_message(
         )
 
     except Exception:
-
         log.exception(
             "Telegram send error"
         )
@@ -2360,27 +1989,15 @@ async def handle_business_message(
 
 async def main():
 
-    log.info(
-        "========================================"
-    )
-
+    log.info("========================================")
     log.info(
         "🍀 MANAGER %s STARTING",
         MANAGER_VERSION,
     )
-
-    log.info(
-        "MODEL: %s",
-        MODEL,
-    )
-
-    log.info(
-        "DATA FILE: %s",
-        DATA_FILE,
-    )
+    log.info("MODEL: %s", MODEL)
+    log.info("DATA FILE: %s", DATA_FILE)
 
     try:
-
         me = await bot.get_me()
 
         log.info(
@@ -2390,28 +2007,18 @@ async def main():
         )
 
     except Exception:
-
         log.exception(
             "Telegram connection failed"
         )
-
         return
 
-    # Если OWNER_ID задан в Railway,
-    # он имеет приоритет.
     owner = get_owner_id()
 
     if owner:
-
-        log.info(
-            "OWNER ID: %s",
-            owner,
-        )
-
+        log.info("OWNER ID: %s", owner)
     else:
-
         log.warning(
-            "OWNER_ID пока не установлен. "
+            "OWNER_ID не установлен. "
             "Первый /start станет владельцем."
         )
 
@@ -2420,21 +2027,15 @@ async def main():
         MANAGER_VERSION,
     )
 
-    log.info(
-        "========================================"
-    )
+    log.info("========================================")
 
     try:
-
         await dp.start_polling(
             bot,
-            allowed_updates=(
-                dp.resolve_used_update_types()
-            ),
+            allowed_updates=dp.resolve_used_update_types(),
         )
 
     finally:
-
         await bot.session.close()
 
 
@@ -2443,7 +2044,4 @@ async def main():
 # =========================================================
 
 if __name__ == "__main__":
-
-    asyncio.run(
-        main()
-    )
+    asyncio.run(main())
