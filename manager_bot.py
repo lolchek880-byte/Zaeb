@@ -19,10 +19,9 @@ from groq import AsyncGroq
 
 # =========================================================
 # MANAGER VERSION
-# При обновлении меняй только это значение
 # =========================================================
 
-MANAGER_VERSION = "0.2.0"
+MANAGER_VERSION = "0.2.1"
 
 
 # =========================================================
@@ -32,7 +31,6 @@ MANAGER_VERSION = "0.2.0"
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Канал для обязательной подписки
 # Например:
 # REQUIRED_CHANNEL=@my_channel
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
@@ -165,7 +163,9 @@ business_connections: dict[str, BusinessConnection] = {}
 # =========================================================
 
 def get_moscow_time() -> str:
-    now = datetime.now(ZoneInfo("Europe/Moscow"))
+    now = datetime.now(
+        ZoneInfo("Europe/Moscow")
+    )
 
     return now.strftime(
         "%d.%m.%Y %H:%M:%S"
@@ -214,11 +214,6 @@ async def is_subscribed(user_id: int) -> bool:
             user_id=user_id,
         )
 
-        # Подписаны:
-        # creator
-        # administrator
-        # member
-
         if member.status in (
             "creator",
             "administrator",
@@ -226,12 +221,13 @@ async def is_subscribed(user_id: int) -> bool:
         ):
             return True
 
-        # Для некоторых каналов/настроек
-        # пользователь может иметь статус restricted,
-        # но оставаться подписанным.
         if member.status == "restricted":
             return bool(
-                getattr(member, "is_member", False)
+                getattr(
+                    member,
+                    "is_member",
+                    False,
+                )
             )
 
         return False
@@ -321,10 +317,6 @@ async def cmd_start(message: Message):
         user.id
     )
 
-    # -----------------------------------------------------
-    # Business Connections
-    # -----------------------------------------------------
-
     connected_count = len(
         business_connections
     )
@@ -334,10 +326,6 @@ async def cmd_start(message: Message):
         for connection in business_connections.values()
         if connection.is_enabled
     )
-
-    # -----------------------------------------------------
-    # Статус подписки
-    # -----------------------------------------------------
 
     if subscribed:
 
@@ -350,10 +338,6 @@ async def cmd_start(message: Message):
         subscription_status = (
             "Подписка: ❌ не подтверждена"
         )
-
-    # -----------------------------------------------------
-    # Статус Business
-    # -----------------------------------------------------
 
     if enabled_connections > 0:
 
@@ -373,6 +357,7 @@ async def cmd_start(message: Message):
         "━━━━━━━━━━━━━━\n"
         f"{subscription_status}\n"
         f"{business_status}\n"
+        f"Подключений: {connected_count}\n"
         "━━━━━━━━━━━━━━\n\n"
         "<b>Как начать:</b>\n"
         "1️⃣ Подпишись на канал.\n"
@@ -426,22 +411,24 @@ async def check_subscription(callback):
             show_alert=True,
         )
 
-        try:
+        if callback.message:
 
-            await callback.message.edit_text(
-                f"✅ <b>Подписка подтверждена!</b>\n\n"
-                f"🍀 Manager {MANAGER_VERSION}\n\n"
-                "Теперь Manager доступен.\n\n"
-                "Подключи его в:\n"
-                "Настройки → Telegram Business → Чат-боты",
-                parse_mode="HTML",
-            )
+            try:
 
-        except Exception:
+                await callback.message.edit_text(
+                    f"✅ <b>Подписка подтверждена!</b>\n\n"
+                    f"🍀 Manager {MANAGER_VERSION}\n\n"
+                    "Теперь Manager доступен.\n\n"
+                    "Подключи его в:\n"
+                    "Настройки → Telegram Business → Чат-боты",
+                    parse_mode="HTML",
+                )
 
-            log.exception(
-                "Не удалось изменить сообщение проверки подписки"
-            )
+            except Exception:
+
+                log.exception(
+                    "Не удалось изменить сообщение проверки подписки"
+                )
 
     else:
 
@@ -465,7 +452,9 @@ async def cmd_away(message: Message):
     if not user:
         return
 
-    if not await is_subscribed(user.id):
+    if not await is_subscribed(
+        user.id
+    ):
 
         await send_subscription_required(
             message
@@ -500,7 +489,9 @@ async def cmd_back(message: Message):
     if not user:
         return
 
-    if not await is_subscribed(user.id):
+    if not await is_subscribed(
+        user.id
+    ):
 
         await send_subscription_required(
             message
@@ -533,7 +524,9 @@ async def cmd_reset(message: Message):
     if not user:
         return
 
-    if not await is_subscribed(user.id):
+    if not await is_subscribed(
+        user.id
+    ):
 
         await send_subscription_required(
             message
@@ -651,7 +644,7 @@ async def handle_business_message(
     )
 
     # -----------------------------------------------------
-    # Connection
+    # CONNECTION
     # -----------------------------------------------------
 
     if not business_connection_id:
@@ -663,7 +656,7 @@ async def handle_business_message(
         return
 
     # -----------------------------------------------------
-    # Только текст
+    # ТОЛЬКО ТЕКСТ
     # -----------------------------------------------------
 
     if not text:
@@ -687,7 +680,7 @@ async def handle_business_message(
         return
 
     # -----------------------------------------------------
-    # Business Connection
+    # BUSINESS CONNECTION
     # -----------------------------------------------------
 
     connection = business_connections.get(
@@ -735,7 +728,7 @@ async def handle_business_message(
         return
 
     # -----------------------------------------------------
-    # Владелец аккаунта
+    # ВЛАДЕЛЕЦ АККАУНТА
     # -----------------------------------------------------
 
     owner_id = (
@@ -756,21 +749,12 @@ async def handle_business_message(
 
         return
 
-# =====================================================
-# ОБЯЗАТЕЛЬНАЯ ПОДПИСКА
-# =====================================================
-
-sender = message.from_user
-
-if sender:
-
-    subscribed = await is_subscribed(
-        sender.id
-    )
-
-    if not subscribed:
-        ...
-        return      
+    # =====================================================
+    # ВАЖНО:
+    # ЗДЕСЬ НЕТ ПРОВЕРКИ ПОДПИСКИ.
+    #
+    # Business-чаты работают независимо от подписки.
+    # =====================================================
 
     # =====================================================
     # HISTORY
@@ -835,14 +819,11 @@ if sender:
                 "role": "system",
                 "content": SYSTEM_PROMPT,
             },
-
             {
                 "role": "system",
                 "content": time_context,
             },
-
             *chat_history,
-
             {
                 "role": "system",
                 "content": variation_instruction,
@@ -971,7 +952,7 @@ async def main():
     )
 
     # -----------------------------------------------------
-    # Проверяем Telegram
+    # ПРОВЕРЯЕМ TELEGRAM
     # -----------------------------------------------------
 
     try:
